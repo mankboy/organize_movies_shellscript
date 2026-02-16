@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Movie Organizer & Folder Cleaner Script for macOS
-# 1. Puts loose .mp4/.mkv files into their own folders
+# 1. Puts loose .mp4/.mkv/.avi files into their own folders
 # 2. Renames folders to "Title (Year)" format
 # 3. Uses Claude AI to look up years for files without parseable years
 # 4. Logs skipped items to Foldersskipped.txt with full paths
@@ -142,9 +142,9 @@ extract_from_contents() {
     extracted_title=""
     extracted_year=""
     
-    # Find first .mp4 or .mkv file in the folder
+    # Find first .mp4, .mkv, or .avi file in the folder
     local video_file
-    video_file=$(find "$folder" -maxdepth 1 -type f \( -iname "*.mp4" -o -iname "*.mkv" \) | head -n 1)
+    video_file=$(find "$folder" -maxdepth 1 -type f \( -iname "*.mp4" -o -iname "*.mkv" -o -iname "*.avi" \) | head -n 1)
     
     if [ -n "$video_file" ]; then
         local filename
@@ -319,7 +319,7 @@ while IFS= read -r -d '' filepath; do
         ((files_skipped++))
     fi
     
-done < <(find "$FOLDER" -maxdepth 1 -type f \( -iname "*.mp4" -o -iname "*.mkv" \) -print0)
+done < <(find "$FOLDER" -maxdepth 1 -type f \( -iname "*.mp4" -o -iname "*.mkv" -o -iname "*.avi" \) -print0)
 
 echo "Files processed: $files_processed"
 echo "Files skipped: $files_skipped"
@@ -440,7 +440,7 @@ else
     video_files=()
     while IFS= read -r -d '' vfile; do
         video_files+=("$vfile")
-    done < <(find "$FOLDER" -mindepth 2 -type f \( -iname "*.mp4" -o -iname "*.mkv" \) -print0)
+    done < <(find "$FOLDER" -mindepth 2 -type f \( -iname "*.mp4" -o -iname "*.mkv" -o -iname "*.avi" \) -print0)
 
     permute_count=${#video_files[@]}
 
