@@ -748,6 +748,21 @@ while IFS= read -r -d '' dirpath; do
         s_year="$extracted_year"
     fi
 
+    # If no year, try extracting from video filenames inside the folder
+    if [ -z "$s_year" ]; then
+        echo "  No year in folder name, checking filenames inside..."
+        while IFS= read -r -d '' vf; do
+            local_fname=$(basename "$vf")
+            local_name="${local_fname%.*}"
+            extract_title_year "$local_name"
+            if [ -n "$extracted_year" ]; then
+                s_year="$extracted_year"
+                echo "  Found year $s_year in file: $local_fname"
+                break
+            fi
+        done < <(find "$dirpath" -maxdepth 2 -type f \( -iname "*.mp4" -o -iname "*.mkv" -o -iname "*.avi" \) -print0 2>/dev/null)
+    fi
+
     # If no year, try Claude
     if [ -z "$s_year" ]; then
         lookup_series_with_claude "$s_name"
