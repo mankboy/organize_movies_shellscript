@@ -7,9 +7,11 @@
 # 2. Organizes TV series folders into "Series Name (Year)/Season XX/" structure
 # 3. Renames movie folders to "Title (Year)" format
 # 4. Uses Claude AI to look up years for files without parseable years
-# 5. Sends organized video files to Permute 3
+# 5. Sends organized video files to Permute 4
 # 6. Excludes sample/small video files (< 50 MiB)
 # 7. Logs skipped items to Foldersskipped.txt with full paths
+
+VERSION="1.0.0"
 
 # Minimum video file size (50 MiB) - smaller files are treated as samples and skipped
 MIN_VIDEO_SIZE=52428800
@@ -30,6 +32,7 @@ if [ -z "$FOLDER" ]; then
     exit 1
 fi
 
+echo "Media Organizer v$VERSION"
 echo "Processing folder: $FOLDER"
 echo "========================================"
 
@@ -557,13 +560,18 @@ files_skipped=0
 samples_skipped=0
 tv_files_processed=0
 
+# Pre-count loose video files for progress display
+total_loose_files=$(find "$FOLDER" -maxdepth 1 -type f \( -iname "*.mp4" -o -iname "*.mkv" -o -iname "*.avi" \) -print0 | tr -dc '\0' | wc -c | tr -d ' ')
+current_loose_file=0
+
 # Find all .mp4, .mkv, and .avi files in the selected folder (not recursive)
 while IFS= read -r -d '' filepath; do
 
     # Get just the filename
     filename=$(basename "$filepath")
+    ((current_loose_file++))
 
-    echo "Processing file: $filename"
+    echo "[$current_loose_file/$total_loose_files] Processing file: $filename"
 
     # Check for sample files (< 50 MiB)
     if is_sample_file "$filepath"; then
@@ -674,16 +682,21 @@ tv_series_organized=0
 tv_series_skipped=0
 tv_series_clean=0
 
+# Pre-count directories for progress display
+total_dirs_p2=$(find "$FOLDER" -maxdepth 1 -mindepth 1 -type d ! -name ".*" -print0 | tr -dc '\0' | wc -c | tr -d ' ')
+current_dir_p2=0
+
 while IFS= read -r -d '' dirpath; do
 
     # Skip if folder was removed during earlier processing
     [ ! -d "$dirpath" ] && continue
 
     foldername=$(basename "$dirpath")
+    ((current_dir_p2++))
 
     # Check if already in correct TV series format: "Name (Year)" with Season subfolders
     if [[ $foldername =~ ^.+\ \((19|20)[0-9]{2}\)$ ]] && has_season_subfolders "$dirpath"; then
-        echo "Processing TV series: $foldername"
+        echo "[$current_dir_p2/$total_dirs_p2] Processing TV series: $foldername"
         echo "  Already in correct format. Normalizing season names..."
         normalize_season_subfolders "$dirpath"
         echo ""
@@ -713,7 +726,7 @@ while IFS= read -r -d '' dirpath; do
         continue
     fi
 
-    echo "Processing TV series: $foldername"
+    echo "[$current_dir_p2/$total_dirs_p2] Processing TV series: $foldername"
 
     # Extract series info from folder name
     extract_series_info "$foldername"
@@ -852,13 +865,18 @@ folders_renamed=0
 folders_skipped=0
 folders_clean=0
 
+# Pre-count directories for progress display
+total_dirs_p3=$(find "$FOLDER" -maxdepth 1 -mindepth 1 -type d ! -name ".*" -print0 | tr -dc '\0' | wc -c | tr -d ' ')
+current_dir_p3=0
+
 # Find all directories in the selected folder (not recursive, exclude hidden)
 while IFS= read -r -d '' dirpath; do
 
     # Get just the folder name
     foldername=$(basename "$dirpath")
+    ((current_dir_p3++))
 
-    echo "Processing folder: $foldername"
+    echo "[$current_dir_p3/$total_dirs_p3] Processing folder: $foldername"
 
     # Skip TV series folders (those with Season subfolders)
     if has_season_subfolders "$dirpath"; then
@@ -958,17 +976,17 @@ else
 fi
 
 # ========================================
-# PHASE 4: Send organized files to Permute 3
+# PHASE 4: Send organized files to Permute 4
 # ========================================
 echo ""
-echo "PHASE 4: Sending video files to Permute 3..."
+echo "PHASE 4: Sending video files to Permute 4..."
 echo "----------------------------------------"
 
-# Check if Permute 3 is installed
-permute_path=$(mdfind "kMDItemCFBundleIdentifier == 'com.charliemonroe.Permute-3'" 2>/dev/null | head -n 1)
+# Check if Permute 4 is installed
+permute_path=$(mdfind "kMDItemCFBundleIdentifier == 'com.charliemonroe.Permute-4'" 2>/dev/null | head -n 1)
 
 if [ -z "$permute_path" ]; then
-    echo "  WARNING: Permute 3 not found. Skipping."
+    echo "  WARNING: Permute 4 not found. Skipping."
     permute_count=0
 else
     # Collect all non-sample video files from organized subfolders
@@ -985,20 +1003,24 @@ else
     if [ "$permute_count" -eq 0 ]; then
         echo "  No video files found in organized folders."
     else
-        echo "  Found $permute_count video file(s). Opening in Permute 3..."
+        echo "  Found $permute_count video file(s). Opening in Permute 4..."
 
         # Open files in batches to avoid argument length limits
         batch_size=20
+        batch_num=0
+        total_batches=$(( (permute_count + batch_size - 1) / batch_size ))
         for ((i = 0; i < permute_count; i += batch_size)); do
+            ((batch_num++))
             batch=("${video_files[@]:i:batch_size}")
-            open -a "Permute 3" "${batch[@]}"
+            echo "  [batch $batch_num/$total_batches] Sending ${#batch[@]} file(s)..."
+            open -a "Permute 4" "${batch[@]}"
             # Brief pause between batches to let Permute process the additions
             if (( i + batch_size < permute_count )); then
                 sleep 1
             fi
         done
 
-        echo "  Sent $permute_count file(s) to Permute 3."
+        echo "  Sent $permute_count file(s) to Permute 4."
     fi
 fi
 
@@ -1014,9 +1036,9 @@ echo "  Movie folders renamed: $folders_renamed"
 echo "  Movie folders already clean: $folders_clean"
 echo "  Movie folders skipped: $folders_skipped"
 echo "  Sample files excluded: $samples_skipped"
-echo "  Files sent to Permute 3: $permute_count"
+echo "  Files sent to Permute 4: $permute_count"
 echo "========================================"
 echo "Done!"
 
 # Show completion dialog
-osascript -e 'display notification "Organization complete! '"$files_processed"' movies, '"$tv_files_processed"' TV episodes, '"$tv_series_organized"' TV series. '"$permute_count"' files sent to Permute 3." with title "Media Organizer"'
+osascript -e 'display notification "Organization complete! '"$files_processed"' movies, '"$tv_files_processed"' TV episodes, '"$tv_series_organized"' TV series. '"$permute_count"' files sent to Permute 4." with title "Media Organizer"'
