@@ -6,38 +6,221 @@
 #    - TV Episodes → "Series Name (Year)/Season XX/" folders
 # 2. Organizes TV series folders into "Series Name (Year)/Season XX/" structure
 # 3. Renames movie folders to "Title (Year)" format
-# 4. Uses Claude AI to look up years for files without parseable years
-# 5. Sends organized video files to Permute 4
-# 6. Excludes sample/small video files (< 50 MiB)
-# 7. Logs skipped items to Foldersskipped.txt with full paths
+# 4. Uses TMDB API to look up years, with Claude AI as fallback
+# 5. Deletes junk files (screenshots, NFOs, samples) while preserving subtitles
+# 6. Optionally sends .mkv files to Permute 3 or 4 for conversion
+# 7. Excludes sample/small video files (< 50 MiB)
+# 8. Logs skipped items to Foldersskipped.txt with full paths
 
-VERSION="1.0.0"
+VERSION="2.0.1"
 
 # Minimum video file size (50 MiB) - smaller files are treated as samples and skipped
 MIN_VIDEO_SIZE=52428800
 
-# Anthropic API key - set this environment variable or replace with your key
-ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-ANTHROPIC_API_KEY_REMOVED}"
+# Script directory (for .env file management)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Use osascript to open a folder selection dialog
-FOLDER=$(osascript -e 'tell application "Finder"
+# Auto-load .env file if it exists (preserves keys across runs)
+if [ -f "${SCRIPT_DIR}/.env" ]; then
+    # shellcheck source=/dev/null
+    source "${SCRIPT_DIR}/.env"
+fi
+
+# TMDB API key (free, register at https://www.themoviedb.org/settings/api)
+# Loaded from .env, environment variable, or configured via GUI
+TMDB_API_KEY="${TMDB_API_KEY:-}"
+
+# Anthropic API key (optional fallback, from https://console.anthropic.com/)
+# Loaded from .env, environment variable, or configured via GUI
+ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
+
+# Skip interactive GUI and setup when sourced for testing
+if [ "${TESTING:-}" = "true" ]; then
+    FOLDER=""
+    PERMUTE_CHOICE="none"
+    REPROCESS_MODE=false
+    skipped_paths=()
+    SKIP_LOG=""
+fi
+
+if [ "${TESTING:-}" != "true" ]; then
+# ========================================
+# GUI Launcher
+# ========================================
+
+# Helper to save settings to .env
+save_env() {
+    {
+        echo "# Media Organizer - Settings"
+        echo "# Auto-saved by GUI. See .env.example for manual setup."
+        echo ""
+        echo "# TMDB API key (free, register at https://www.themoviedb.org/settings/api)"
+        echo "export TMDB_API_KEY='${TMDB_API_KEY}'"
+        echo ""
+        echo "# Anthropic API key (optional fallback, from https://console.anthropic.com/)"
+        echo "export ANTHROPIC_API_KEY='${ANTHROPIC_API_KEY}'"
+        echo ""
+        echo "# Last selected Permute version (none, 3, or 4)"
+        echo "export PERMUTE_LAST_CHOICE='${PERMUTE_CHOICE}'"
+    } > "${SCRIPT_DIR}/.env"
+}
+
+# Detect installed Permute versions
+HAS_PERMUTE3=false
+HAS_PERMUTE4=false
+if [ -n "$(mdfind "kMDItemCFBundleIdentifier == 'com.charliemonroe.Permute-3'" 2>/dev/null | head -n 1)" ]; then
+    HAS_PERMUTE3=true
+fi
+if [ -n "$(mdfind "kMDItemCFBundleIdentifier == 'com.charliemonroe.Permute-4'" 2>/dev/null | head -n 1)" ]; then
+    HAS_PERMUTE4=true
+fi
+
+# Step 1: API Key Configuration
+# Auto-skip if both keys are already set, unless SHIFT is held
+show_key_dialog=true
+if [ -n "$TMDB_API_KEY" ] && [ -n "$ANTHROPIC_API_KEY" ]; then
+    shift_held=$(osascript -l JavaScript -e \
+        'ObjC.import("Cocoa"); ($.NSEvent.modifierFlags & $.NSEventModifierFlagShift) != 0' 2>/dev/null)
+    if [ "$shift_held" != "true" ]; then
+        show_key_dialog=false
+    fi
+fi
+
+if $show_key_dialog; then
+    tmdb_status="not set"
+    claude_status="not set"
+    [ -n "$TMDB_API_KEY" ] && tmdb_status="configured"
+    [ -n "$ANTHROPIC_API_KEY" ] && claude_status="configured"
+
+    key_action=$(osascript -e "
+    display dialog \"API Keys:
+  TMDB: ${tmdb_status}
+  Claude AI: ${claude_status}
+
+Would you like to configure API keys?\" buttons {\"Cancel\", \"Configure Keys\", \"Continue\"} default button \"Continue\" with title \"Media Organizer v${VERSION}\"
+    set the button_pressed to the button returned of the result
+    return button_pressed
+    " 2>/dev/null)
+
+    if [ -z "$key_action" ]; then
+        echo "Cancelled. Exiting."
+        exit 1
+    fi
+
+    if [ "$key_action" = "Configure Keys" ]; then
+        # TMDB API key dialog
+        new_tmdb=$(osascript -e "
+        set defaultVal to \"${TMDB_API_KEY}\"
+        display dialog \"Enter your TMDB API key:
+(Free, register at themoviedb.org/settings/api)\" default answer defaultVal buttons {\"Cancel\", \"OK\"} default button \"OK\" with title \"Media Organizer v${VERSION}\"
+        return text returned of the result
+        " 2>/dev/null)
+
+        if [ -z "$new_tmdb" ]; then
+            echo "Cancelled. Exiting."
+            exit 1
+        fi
+
+        # Anthropic API key dialog
+        new_anthropic=$(osascript -e "
+        set defaultVal to \"${ANTHROPIC_API_KEY}\"
+        display dialog \"Enter your Anthropic API key (optional):
+(For Claude AI fallback, from console.anthropic.com)\" default answer defaultVal buttons {\"Skip\", \"OK\"} default button \"OK\" with title \"Media Organizer v${VERSION}\"
+        set btn to button returned of the result
+        if btn is \"Skip\" then
+            return \"__SKIP__\"
+        end if
+        return text returned of the result
+        " 2>/dev/null)
+
+        # Update keys in memory
+        TMDB_API_KEY="$new_tmdb"
+        export TMDB_API_KEY
+        if [ "$new_anthropic" != "__SKIP__" ] && [ -n "$new_anthropic" ]; then
+            ANTHROPIC_API_KEY="$new_anthropic"
+            export ANTHROPIC_API_KEY
+        fi
+
+        echo "API keys saved to ${SCRIPT_DIR}/.env"
+    fi
+fi
+
+# Step 2: Folder Selection
+FOLDER=$(osascript -e "tell application \"Finder\"
     activate
-    set selectedFolder to choose folder with prompt "Select the folder containing your video files/folders:"
+    set selectedFolder to choose folder with prompt \"Select the folder containing your video files/folders:\"
     return POSIX path of selectedFolder
-end tell' 2>/dev/null)
+end tell" 2>/dev/null)
 
-# Check if user cancelled
 if [ -z "$FOLDER" ]; then
     echo "No folder selected. Exiting."
     exit 1
 fi
 
+# Step 3: Permute Selection
+# Load previous choice as default
+PERMUTE_CHOICE="${PERMUTE_LAST_CHOICE:-none}"
+
+if $HAS_PERMUTE3 || $HAS_PERMUTE4; then
+    # Build the list of available options
+    permute_options="\"No conversion\""
+    $HAS_PERMUTE3 && permute_options="${permute_options}, \"Permute 3\""
+    $HAS_PERMUTE4 && permute_options="${permute_options}, \"Permute 4\""
+
+    # Determine default selection from last run
+    default_item="No conversion"
+    if [ "$PERMUTE_CHOICE" = "3" ] && $HAS_PERMUTE3; then
+        default_item="Permute 3"
+    elif [ "$PERMUTE_CHOICE" = "4" ] && $HAS_PERMUTE4; then
+        default_item="Permute 4"
+    fi
+
+    permute_selection=$(osascript -e "
+    choose from list {${permute_options}} with prompt \"Send .mkv files to Permute for conversion?\" with title \"Media Organizer v${VERSION}\" default items {\"${default_item}\"}
+    " 2>/dev/null)
+
+    if [ -z "$permute_selection" ] || [ "$permute_selection" = "false" ]; then
+        PERMUTE_CHOICE="none"
+    elif [ "$permute_selection" = "Permute 3" ]; then
+        PERMUTE_CHOICE="3"
+    elif [ "$permute_selection" = "Permute 4" ]; then
+        PERMUTE_CHOICE="4"
+    fi
+fi
+
+# Save all settings to .env
+save_env
+
 echo "Media Organizer v$VERSION"
 echo "Processing folder: $FOLDER"
 echo "========================================"
 
-# Create/clear the skipped log file
+# Skip log file path
 SKIP_LOG="${FOLDER}Foldersskipped.txt"
+
+# ========================================
+# Reprocess Mode Detection
+# ========================================
+# If a skip log already exists, enter reprocess mode:
+# only retry the previously-skipped items instead of processing everything.
+REPROCESS_MODE=false
+skipped_paths=()
+
+if [ -f "$SKIP_LOG" ]; then
+    REPROCESS_MODE=true
+    # Parse FULL PATH entries from existing skip log
+    while IFS= read -r line; do
+        if [[ $line =~ ^FULL\ PATH:\ (.+)$ ]]; then
+            skipped_paths+=("${BASH_REMATCH[1]}")
+        fi
+    done < "$SKIP_LOG"
+    echo ""
+    echo "Reprocess mode: found Foldersskipped.txt"
+    echo "  Retrying ${#skipped_paths[@]} previously-skipped items..."
+    echo ""
+fi
+
+# Create/clear the skipped log file (fresh for this run)
 echo "Skipped Items Log - $(date)" > "$SKIP_LOG"
 echo "========================================" >> "$SKIP_LOG"
 echo "" >> "$SKIP_LOG"
@@ -46,9 +229,22 @@ echo "" >> "$SKIP_LOG"
 echo "========================================" >> "$SKIP_LOG"
 echo "" >> "$SKIP_LOG"
 
+fi  # end of: if [ "${TESTING:-}" != "true" ]
+
 # ========================================
 # Helper Functions
 # ========================================
+
+# Check if a path was in the previous skip list
+path_in_skip_list() {
+    local check_path="$1"
+    for sp in "${skipped_paths[@]}"; do
+        if [ "$sp" = "$check_path" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
 
 # Function to log skipped folder with contents
 log_skipped_folder() {
@@ -98,6 +294,15 @@ strip_torrent_prefix() {
     # "[Site.tld] " prefix
     result=$(echo "$result" | sed 's/^\[[A-Za-z0-9._-]*\][[:space:]]*//')
     echo "$result"
+}
+
+# Sanitize a folder name for macOS Finder
+# Colons show as "/" in Finder, so replace with " -"
+sanitize_foldername() {
+    local name="$1"
+    name="${name//:/ -}"
+    # Collapse any resulting double spaces
+    echo "$name" | sed 's/  */ /g'
 }
 
 # Check if a video file is a sample (< 50 MiB)
@@ -208,6 +413,132 @@ extract_from_contents() {
         extract_title_year "$name_no_ext"
     fi
 }
+
+# ========================================
+# TMDB API Lookup Functions
+# ========================================
+
+# Function to look up movie year using TMDB API
+# Sets extracted_title and extracted_year globals
+lookup_year_with_tmdb() {
+    local input="$1"
+    extracted_title=""
+    extracted_year=""
+
+    if [ -z "$TMDB_API_KEY" ]; then
+        echo "  (TMDB API key not set, skipping TMDB lookup)"
+        return 1
+    fi
+
+    # Clean up the input - replace underscores/dots with spaces
+    local clean_name="${input//./ }"
+    clean_name="${clean_name//_/ }"
+    clean_name=$(echo "$clean_name" | sed 's/[[:space:]][[:space:]]*/ /g; s/^[[:space:]]*//; s/[[:space:]]*$//')
+
+    echo "  Looking up movie on TMDB: $clean_name"
+
+    # URL-encode the query
+    local encoded_query
+    encoded_query=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$clean_name" 2>/dev/null)
+
+    local response
+    response=$(curl -s "https://api.themoviedb.org/3/search/movie?query=${encoded_query}&api_key=${TMDB_API_KEY}" 2>/dev/null)
+
+    # Check if we got results
+    local total_results
+    total_results=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total_results',0))" 2>/dev/null)
+
+    if [ "$total_results" = "0" ] || [ -z "$total_results" ]; then
+        echo "  (TMDB found no movie results)"
+        return 1
+    fi
+
+    # Extract title and release_date from first result
+    local tmdb_title tmdb_date
+    tmdb_title=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin)['results'][0]['title'])" 2>/dev/null)
+    tmdb_date=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin)['results'][0].get('release_date',''))" 2>/dev/null)
+
+    if [ -z "$tmdb_title" ] || [ -z "$tmdb_date" ]; then
+        echo "  (TMDB result missing title or date)"
+        return 1
+    fi
+
+    # Extract year from date (format: YYYY-MM-DD)
+    local tmdb_year="${tmdb_date:0:4}"
+
+    if [[ $tmdb_year =~ ^(19|20)[0-9]{2}$ ]]; then
+        extracted_title="$tmdb_title"
+        extracted_year="$tmdb_year"
+        echo "  TMDB identified: $extracted_title ($extracted_year)"
+        return 0
+    else
+        echo "  (TMDB returned invalid date: $tmdb_date)"
+        return 1
+    fi
+}
+
+# Function to look up TV series year using TMDB API
+# Sets extracted_title and extracted_year globals
+lookup_series_with_tmdb() {
+    local input="$1"
+    extracted_title=""
+    extracted_year=""
+
+    if [ -z "$TMDB_API_KEY" ]; then
+        echo "  (TMDB API key not set, skipping TMDB lookup)"
+        return 1
+    fi
+
+    # Clean up the input - replace underscores/dots with spaces
+    local clean_name="${input//./ }"
+    clean_name="${clean_name//_/ }"
+    clean_name=$(echo "$clean_name" | sed 's/[[:space:]][[:space:]]*/ /g; s/^[[:space:]]*//; s/[[:space:]]*$//')
+
+    echo "  Looking up TV series on TMDB: $clean_name"
+
+    # URL-encode the query
+    local encoded_query
+    encoded_query=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$clean_name" 2>/dev/null)
+
+    local response
+    response=$(curl -s "https://api.themoviedb.org/3/search/tv?query=${encoded_query}&api_key=${TMDB_API_KEY}" 2>/dev/null)
+
+    # Check if we got results
+    local total_results
+    total_results=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total_results',0))" 2>/dev/null)
+
+    if [ "$total_results" = "0" ] || [ -z "$total_results" ]; then
+        echo "  (TMDB found no TV series results)"
+        return 1
+    fi
+
+    # Extract name and first_air_date from first result
+    local tmdb_title tmdb_date
+    tmdb_title=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin)['results'][0]['name'])" 2>/dev/null)
+    tmdb_date=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin)['results'][0].get('first_air_date',''))" 2>/dev/null)
+
+    if [ -z "$tmdb_title" ] || [ -z "$tmdb_date" ]; then
+        echo "  (TMDB result missing title or air date)"
+        return 1
+    fi
+
+    # Extract year from date (format: YYYY-MM-DD)
+    local tmdb_year="${tmdb_date:0:4}"
+
+    if [[ $tmdb_year =~ ^(19|20)[0-9]{2}$ ]]; then
+        extracted_title="$tmdb_title"
+        extracted_year="$tmdb_year"
+        echo "  TMDB identified: $extracted_title ($extracted_year)"
+        return 0
+    else
+        echo "  (TMDB returned invalid date: $tmdb_date)"
+        return 1
+    fi
+}
+
+# ========================================
+# Claude AI Lookup Functions
+# ========================================
 
 # Function to look up movie year using Claude AI API
 # Sets extracted_title and extracted_year globals
@@ -548,11 +879,20 @@ EOF
     return 1
 }
 
+# Allow sourcing for testing without running main logic
+if [ "${TESTING:-}" = "true" ]; then
+    return 0 2>/dev/null || exit 0
+fi
+
 # ========================================
 # PHASE 1: Process loose video files
 # ========================================
 echo ""
-echo "PHASE 1: Processing loose video files..."
+if $REPROCESS_MODE; then
+    echo "PHASE 1: Reprocessing skipped loose video files..."
+else
+    echo "PHASE 1: Processing loose video files..."
+fi
 echo "----------------------------------------"
 
 files_processed=0
@@ -561,11 +901,23 @@ samples_skipped=0
 tv_files_processed=0
 
 # Pre-count loose video files for progress display
-total_loose_files=$(find "$FOLDER" -maxdepth 1 -type f \( -iname "*.mp4" -o -iname "*.mkv" -o -iname "*.avi" \) -print0 | tr -dc '\0' | wc -c | tr -d ' ')
+if $REPROCESS_MODE; then
+    total_loose_files=0
+    for sp in "${skipped_paths[@]}"; do
+        [ -f "$sp" ] && ((total_loose_files++))
+    done
+else
+    total_loose_files=$(find "$FOLDER" -maxdepth 1 -type f \( -iname "*.mp4" -o -iname "*.mkv" -o -iname "*.avi" \) -print0 | tr -dc '\0' | wc -c | tr -d ' ')
+fi
 current_loose_file=0
 
 # Find all .mp4, .mkv, and .avi files in the selected folder (not recursive)
 while IFS= read -r -d '' filepath; do
+
+    # In reprocess mode, only process files from the previous skip log
+    if $REPROCESS_MODE; then
+        path_in_skip_list "$filepath" || continue
+    fi
 
     # Get just the filename
     filename=$(basename "$filepath")
@@ -602,7 +954,14 @@ while IFS= read -r -d '' filepath; do
             s_year="$extracted_year"
         fi
 
-        # If no year found, try Claude
+        # If no year found, try TMDB
+        if [ -z "$s_year" ] && [ -n "$s_name" ]; then
+            lookup_series_with_tmdb "$s_name"
+            s_year="$extracted_year"
+            [ -n "$extracted_title" ] && s_name="$extracted_title"
+        fi
+
+        # If still no year, try Claude as fallback
         if [ -z "$s_year" ] && [ -n "$s_name" ]; then
             lookup_series_with_claude "$s_name"
             s_year="$extracted_year"
@@ -610,7 +969,7 @@ while IFS= read -r -d '' filepath; do
         fi
 
         if [ -n "$s_name" ] && [ -n "$s_year" ] && [ -n "$s_season" ]; then
-            target_series="${s_name} (${s_year})"
+            target_series=$(sanitize_foldername "${s_name} (${s_year})")
             target_path="${FOLDER}${target_series}/Season ${s_season}"
 
             mkdir -p "$target_path"
@@ -630,7 +989,12 @@ while IFS= read -r -d '' filepath; do
     # Movie processing (existing logic)
     extract_title_year "$name_no_ext"
 
-    # If regex extraction failed, try Claude AI lookup
+    # If regex extraction failed, try TMDB lookup
+    if [ -z "$extracted_title" ] || [ -z "$extracted_year" ]; then
+        lookup_year_with_tmdb "$name_no_ext"
+    fi
+
+    # If still no match, try Claude AI as fallback
     if [ -z "$extracted_title" ] || [ -z "$extracted_year" ]; then
         lookup_year_with_claude "$name_no_ext"
     fi
@@ -675,7 +1039,11 @@ echo "Files skipped: $files_skipped"
 # PHASE 2: Organize TV series folders
 # ========================================
 echo ""
-echo "PHASE 2: Organizing TV series folders..."
+if $REPROCESS_MODE; then
+    echo "PHASE 2: Reprocessing skipped TV series folders..."
+else
+    echo "PHASE 2: Organizing TV series folders..."
+fi
 echo "----------------------------------------"
 
 tv_series_organized=0
@@ -683,7 +1051,14 @@ tv_series_skipped=0
 tv_series_clean=0
 
 # Pre-count directories for progress display
-total_dirs_p2=$(find "$FOLDER" -maxdepth 1 -mindepth 1 -type d ! -name ".*" -print0 | tr -dc '\0' | wc -c | tr -d ' ')
+if $REPROCESS_MODE; then
+    total_dirs_p2=0
+    for sp in "${skipped_paths[@]}"; do
+        [ -d "$sp" ] && ((total_dirs_p2++))
+    done
+else
+    total_dirs_p2=$(find "$FOLDER" -maxdepth 1 -mindepth 1 -type d ! -name ".*" -print0 | tr -dc '\0' | wc -c | tr -d ' ')
+fi
 current_dir_p2=0
 
 while IFS= read -r -d '' dirpath; do
@@ -691,11 +1066,18 @@ while IFS= read -r -d '' dirpath; do
     # Skip if folder was removed during earlier processing
     [ ! -d "$dirpath" ] && continue
 
+    # In reprocess mode, only process folders from the previous skip log
+    if $REPROCESS_MODE; then
+        path_in_skip_list "$dirpath" || continue
+    fi
+
     foldername=$(basename "$dirpath")
+    foldername_clean=$(strip_torrent_prefix "$foldername")
     ((current_dir_p2++))
 
     # Check if already in correct TV series format: "Name (Year)" with Season subfolders
-    if [[ $foldername =~ ^.+\ \((19|20)[0-9]{2}\)$ ]] && has_season_subfolders "$dirpath"; then
+    # Also require no torrent prefix was stripped (otherwise needs renaming)
+    if [ "$foldername_clean" = "$foldername" ] && [[ $foldername =~ ^.+\ \((19|20)[0-9]{2}\)$ ]] && has_season_subfolders "$dirpath"; then
         echo "[$current_dir_p2/$total_dirs_p2] Processing TV series: $foldername"
         echo "  Already in correct format. Normalizing season names..."
         normalize_season_subfolders "$dirpath"
@@ -728,23 +1110,27 @@ while IFS= read -r -d '' dirpath; do
 
     echo "[$current_dir_p2/$total_dirs_p2] Processing TV series: $foldername"
 
-    # Extract series info from folder name
-    extract_series_info "$foldername"
+    # Extract series info from cleaned folder name (prefix stripped)
+    extract_series_info "$foldername_clean"
     s_name="$series_name"
     s_season="$season_number"
 
-    # If no series name extracted, use folder name
+    # If no series name extracted, use cleaned folder name
     if [ -z "$s_name" ]; then
-        s_name="$foldername"
+        s_name="$foldername_clean"
     fi
 
-    # Try to get year from folder name or series name
+    # Try to get year from series name or cleaned folder name
     s_year=""
     extract_title_year "$s_name"
     s_year="$extracted_year"
+    # Use cleaned title to avoid "Title 2026 (2026)" redundancy
+    if [ -n "$extracted_title" ] && [ -n "$s_year" ]; then
+        s_name="$extracted_title"
+    fi
 
     if [ -z "$s_year" ]; then
-        extract_title_year "$foldername"
+        extract_title_year "$foldername_clean"
         s_year="$extracted_year"
     fi
 
@@ -763,7 +1149,16 @@ while IFS= read -r -d '' dirpath; do
         done < <(find "$dirpath" -maxdepth 2 -type f \( -iname "*.mp4" -o -iname "*.mkv" -o -iname "*.avi" \) -print0 2>/dev/null)
     fi
 
-    # If no year, try Claude
+    # If no year, try TMDB
+    if [ -z "$s_year" ]; then
+        lookup_series_with_tmdb "$s_name"
+        s_year="$extracted_year"
+        if [ -n "$extracted_title" ]; then
+            s_name="$extracted_title"
+        fi
+    fi
+
+    # If still no year, try Claude as fallback
     if [ -z "$s_year" ]; then
         lookup_series_with_claude "$s_name"
         s_year="$extracted_year"
@@ -784,7 +1179,7 @@ while IFS= read -r -d '' dirpath; do
     # (happens when folder is already named "Series (Year)" with loose episode files inside)
     s_name=$(echo "$s_name" | sed 's/[[:space:]]*([0-9][0-9][0-9][0-9])[[:space:]]*$//')
 
-    target_series="${s_name} (${s_year})"
+    target_series=$(sanitize_foldername "${s_name} (${s_year})")
     target_path="${FOLDER}${target_series}"
 
     echo "  Target: $target_series"
@@ -873,7 +1268,11 @@ echo "TV series skipped: $tv_series_skipped"
 # PHASE 3: Clean up movie folder names
 # ========================================
 echo ""
-echo "PHASE 3: Cleaning up movie folder names..."
+if $REPROCESS_MODE; then
+    echo "PHASE 3: Reprocessing skipped movie folder names..."
+else
+    echo "PHASE 3: Cleaning up movie folder names..."
+fi
 echo "----------------------------------------"
 
 folders_renamed=0
@@ -881,11 +1280,21 @@ folders_skipped=0
 folders_clean=0
 
 # Pre-count directories for progress display
-total_dirs_p3=$(find "$FOLDER" -maxdepth 1 -mindepth 1 -type d ! -name ".*" -print0 | tr -dc '\0' | wc -c | tr -d ' ')
+if $REPROCESS_MODE; then
+    # In reprocess mode, reuse the same count from Phase 2 (same folder pool)
+    total_dirs_p3=$total_dirs_p2
+else
+    total_dirs_p3=$(find "$FOLDER" -maxdepth 1 -mindepth 1 -type d ! -name ".*" -print0 | tr -dc '\0' | wc -c | tr -d ' ')
+fi
 current_dir_p3=0
 
 # Find all directories in the selected folder (not recursive, exclude hidden)
 while IFS= read -r -d '' dirpath; do
+
+    # In reprocess mode, only process folders from the previous skip log
+    if $REPROCESS_MODE; then
+        path_in_skip_list "$dirpath" || continue
+    fi
 
     # Get just the folder name
     foldername=$(basename "$dirpath")
@@ -928,7 +1337,12 @@ while IFS= read -r -d '' dirpath; do
         extract_from_contents "$dirpath"
     fi
 
-    # If still no year, try Claude AI lookup (using cleaned name for better results)
+    # If still no year, try TMDB lookup
+    if [ -z "$extracted_title" ] || [ -z "$extracted_year" ]; then
+        lookup_year_with_tmdb "$foldername_clean"
+    fi
+
+    # If still no year, try Claude AI as fallback
     if [ -z "$extracted_title" ] || [ -z "$extracted_year" ]; then
         lookup_year_with_claude "$foldername_clean"
     fi
@@ -936,8 +1350,8 @@ while IFS= read -r -d '' dirpath; do
     # If we found a title and year, process it
     if [ -n "$extracted_title" ] && [ -n "$extracted_year" ]; then
 
-        # Create the new folder name
-        new_foldername="${extracted_title} (${extracted_year})"
+        # Create the new folder name (sanitize colons — they show as / in Finder)
+        new_foldername=$(sanitize_foldername "${extracted_title} (${extracted_year})")
 
         # Check if new name is same as old (after cleaning)
         if [ "$foldername" = "$new_foldername" ]; then
@@ -976,6 +1390,98 @@ while IFS= read -r -d '' dirpath; do
 done < <(find "$FOLDER" -maxdepth 1 -mindepth 1 -type d ! -name ".*" -print0)
 
 # ========================================
+# PHASE 4: Clean up junk files
+# ========================================
+echo ""
+if $REPROCESS_MODE; then
+    echo "PHASE 4: Skipping junk cleanup in reprocess mode."
+    echo "----------------------------------------"
+    junk_deleted=0
+    samples_deleted=0
+else
+    echo "PHASE 4: Cleaning up junk files..."
+    echo "----------------------------------------"
+
+    junk_deleted=0
+    samples_deleted=0
+    zero_deleted=0
+    duplicates_deleted=0
+
+    # Extensions to delete (case-insensitive) — preserves subtitles (.srt, .sub, .ass, .ssa, .vtt, .idx)
+    junk_extensions="jpg|jpeg|png|bmp|gif|tif|tiff|webp|txt|nfo|info|url|html|htm|xml|exe|lnk|bat|cmd|torrent|ds_store"
+
+    # Scan all files inside organized subfolders (mindepth 2 = inside movie/series folders only)
+    while IFS= read -r -d '' junk_file; do
+        filename=$(basename "$junk_file")
+        ext="${filename##*.}"
+        ext=$(echo "$ext" | tr '[:upper:]' '[:lower:]')
+
+        # Delete zero-byte files
+        file_size=$(stat -f%z "$junk_file" 2>/dev/null)
+        if [ -n "$file_size" ] && [ "$file_size" -eq 0 ]; then
+            rm "$junk_file"
+            echo "  Deleted empty: $filename (0 bytes)"
+            ((zero_deleted++))
+            continue
+        fi
+
+        # Delete junk extensions
+        if [[ $ext =~ ^($junk_extensions)$ ]]; then
+            rm "$junk_file"
+            echo "  Deleted: $filename"
+            ((junk_deleted++))
+            continue
+        fi
+
+        # Delete sample video files (< 50 MiB)
+        if is_sample_file "$junk_file"; then
+            file_size_mb=$(( file_size / 1048576 ))
+            rm "$junk_file"
+            echo "  Deleted sample: $filename (${file_size_mb} MiB)"
+            ((samples_deleted++))
+        fi
+    done < <(find "$FOLDER" -mindepth 2 -type f -print0)
+
+    # Delete duplicate files: pre-conversion .mkv/.avi where converted .mp4 exists
+    while IFS= read -r -d '' mkv_file; do
+        mp4_file="${mkv_file%.*}.mp4"
+        if [ -f "$mp4_file" ]; then
+            filename=$(basename "$mkv_file")
+            rm "$mkv_file"
+            echo "  Deleted pre-conversion: $filename (.mp4 exists)"
+            ((duplicates_deleted++))
+        fi
+    done < <(find "$FOLDER" -mindepth 2 -type f \( -iname "*.mkv" -o -iname "*.avi" \) -print0)
+
+    # Delete duplicate files: " - 01" suffix variants (duplicate downloads)
+    while IFS= read -r -d '' dup_file; do
+        filename=$(basename "$dup_file")
+        dirn=$(dirname "$dup_file")
+        # Extract original name by removing " - 01" before the extension
+        if [[ $filename =~ ^(.+)\ -\ 0[0-9](\.[^.]+)$ ]]; then
+            original="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+            if [ -f "${dirn}/${original}" ]; then
+                rm "$dup_file"
+                echo "  Deleted duplicate: $filename (original exists)"
+                ((duplicates_deleted++))
+            fi
+        fi
+    done < <(find "$FOLDER" -mindepth 2 -type f -name "* - 0[0-9].*" -print0)
+
+    # Remove empty directories left behind after cleanup
+    empty_dirs_deleted=0
+    while IFS= read -r -d '' empty_dir; do
+        rmdir "$empty_dir" 2>/dev/null && ((empty_dirs_deleted++))
+    done < <(find "$FOLDER" -mindepth 2 -type d -empty -print0)
+
+    echo "Junk files deleted: $junk_deleted"
+    echo "Sample videos deleted: $samples_deleted"
+    [ "$zero_deleted" -gt 0 ] && echo "Zero-byte files deleted: $zero_deleted"
+    [ "$duplicates_deleted" -gt 0 ] && echo "Duplicate files deleted: $duplicates_deleted"
+    [ "$empty_dirs_deleted" -gt 0 ] && echo "Empty folders removed: $empty_dirs_deleted"
+fi
+
+# ========================================
 # Finalize skip log
 # ========================================
 total_skipped=$((files_skipped + folders_skipped + tv_series_skipped + samples_skipped))
@@ -991,23 +1497,26 @@ else
 fi
 
 # ========================================
-# PHASE 4: Send organized files to Permute 4
+# PHASE 5: Send organized files to Permute
 # ========================================
 echo ""
-echo "PHASE 4: Sending video files to Permute 4..."
-echo "----------------------------------------"
+permute_count=0
 
-# Check if Permute 4 is installed
-permute_path=$(mdfind "kMDItemCFBundleIdentifier == 'com.charliemonroe.Permute-4'" 2>/dev/null | head -n 1)
-
-if [ -z "$permute_path" ]; then
-    echo "  WARNING: Permute 4 not found. Skipping."
-    permute_count=0
+if [ "$PERMUTE_CHOICE" = "none" ]; then
+    echo "PHASE 5: Video conversion skipped (not selected)."
+    echo "----------------------------------------"
+elif $REPROCESS_MODE; then
+    echo "PHASE 5: Sending video files to Permute ${PERMUTE_CHOICE}..."
+    echo "----------------------------------------"
+    echo "  Skipping Permute in reprocess mode."
 else
-    # Collect all non-sample video files from organized subfolders
+    PERMUTE_APP="Permute ${PERMUTE_CHOICE}"
+    echo "PHASE 5: Sending video files to ${PERMUTE_APP}..."
+    echo "----------------------------------------"
+
+    # Collect all non-sample .mkv files from organized subfolders
     video_files=()
     while IFS= read -r -d '' vfile; do
-        # Skip sample files
         if ! is_sample_file "$vfile"; then
             video_files+=("$vfile")
         fi
@@ -1016,26 +1525,68 @@ else
     permute_count=${#video_files[@]}
 
     if [ "$permute_count" -eq 0 ]; then
-        echo "  No video files found in organized folders."
+        echo "  No .mkv files found in organized folders."
     else
-        echo "  Found $permute_count video file(s). Opening in Permute 4..."
+        echo "  Found $permute_count .mkv file(s). Opening in ${PERMUTE_APP}..."
 
-        # Open files in batches to avoid argument length limits
-        batch_size=20
-        batch_num=0
-        total_batches=$(( (permute_count + batch_size - 1) / batch_size ))
-        for ((i = 0; i < permute_count; i += batch_size)); do
-            ((batch_num++))
-            batch=("${video_files[@]:i:batch_size}")
-            echo "  [batch $batch_num/$total_batches] Sending ${#batch[@]} file(s)..."
-            open -a "Permute 4" "${batch[@]}"
-            # Brief pause between batches to let Permute process the additions
-            if (( i + batch_size < permute_count )); then
-                sleep 1
-            fi
+        # Open files one at a time — Permute drops files when given multiple at once
+        for ((i = 0; i < permute_count; i++)); do
+            filename=$(basename "${video_files[$i]}")
+            echo "  [$((i + 1))/$permute_count] Sending: $filename"
+            open -a "$PERMUTE_APP" "${video_files[$i]}"
+            sleep 0.5
         done
 
-        echo "  Sent $permute_count file(s) to Permute 4."
+        echo "  Sent $permute_count file(s) to ${PERMUTE_APP}."
+    fi
+fi
+
+# ========================================
+# PHASE 6: Send music folders to MusicBrainz Picard
+# ========================================
+echo ""
+picard_count=0
+
+picard_installed=false
+if [ -n "$(mdfind "kMDItemCFBundleIdentifier == 'org.musicbrainz.Picard'" 2>/dev/null | head -n 1)" ]; then
+    picard_installed=true
+fi
+
+if ! $picard_installed; then
+    echo "PHASE 6: MusicBrainz Picard not installed — skipping music folders."
+    echo "----------------------------------------"
+elif $REPROCESS_MODE; then
+    echo "PHASE 6: Skipping Picard in reprocess mode."
+    echo "----------------------------------------"
+else
+    echo "PHASE 6: Detecting music folders for MusicBrainz Picard..."
+    echo "----------------------------------------"
+
+    # Find subfolders that contain MP3 or FLAC files (music albums)
+    music_folders=()
+    while IFS= read -r -d '' dirpath; do
+        # Check if folder contains .mp3 or .flac files
+        mp3_count=$(find "$dirpath" -maxdepth 2 -type f \( -iname "*.mp3" -o -iname "*.flac" \) 2>/dev/null | head -n 1)
+        if [ -n "$mp3_count" ]; then
+            music_folders+=("$dirpath")
+        fi
+    done < <(find "$FOLDER" -maxdepth 1 -mindepth 1 -type d -print0)
+
+    picard_count=${#music_folders[@]}
+
+    if [ "$picard_count" -eq 0 ]; then
+        echo "  No music folders found."
+    else
+        echo "  Found $picard_count music folder(s). Opening in MusicBrainz Picard..."
+
+        for ((i = 0; i < picard_count; i++)); do
+            foldername=$(basename "${music_folders[$i]}")
+            echo "  [$((i + 1))/$picard_count] Sending: $foldername"
+            open -a "MusicBrainz Picard" "${music_folders[$i]}"
+            sleep 0.5
+        done
+
+        echo "  Sent $picard_count folder(s) to MusicBrainz Picard."
     fi
 fi
 
@@ -1051,9 +1602,24 @@ echo "  Movie folders renamed: $folders_renamed"
 echo "  Movie folders already clean: $folders_clean"
 echo "  Movie folders skipped: $folders_skipped"
 echo "  Sample files excluded: $samples_skipped"
-echo "  Files sent to Permute 4: $permute_count"
+echo "  Junk files deleted: $junk_deleted"
+echo "  Sample videos deleted: $samples_deleted"
+[ "${zero_deleted:-0}" -gt 0 ] && echo "  Zero-byte files deleted: $zero_deleted"
+[ "${duplicates_deleted:-0}" -gt 0 ] && echo "  Duplicate files deleted: $duplicates_deleted"
+if [ "$PERMUTE_CHOICE" != "none" ]; then
+    echo "  Files sent to Permute ${PERMUTE_CHOICE}: $permute_count"
+fi
+[ "$picard_count" -gt 0 ] && echo "  Music folders sent to Picard: $picard_count"
 echo "========================================"
 echo "Done!"
 
 # Show completion dialog
-osascript -e 'display notification "Organization complete! '"$files_processed"' movies, '"$tv_files_processed"' TV episodes, '"$tv_series_organized"' TV series. '"$permute_count"' files sent to Permute 4." with title "Media Organizer"'
+permute_msg=""
+if [ "$PERMUTE_CHOICE" != "none" ] && [ "$permute_count" -gt 0 ]; then
+    permute_msg=" ${permute_count} files sent to Permute ${PERMUTE_CHOICE}."
+fi
+picard_msg=""
+if [ "$picard_count" -gt 0 ]; then
+    picard_msg=" ${picard_count} music folders sent to Picard."
+fi
+osascript -e "display notification \"Organization complete! ${files_processed} movies, ${tv_files_processed} TV episodes, ${tv_series_organized} TV series.${permute_msg}${picard_msg}\" with title \"Media Organizer\""
