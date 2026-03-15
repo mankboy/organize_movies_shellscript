@@ -291,8 +291,10 @@ strip_torrent_prefix() {
     local result
     # "www.Site.tld - " or "www Site tld - " (dots or spaces between parts)
     result=$(echo "$input" | sed 's/^[Ww][Ww][Ww][. ][A-Za-z0-9._-]*[. ][A-Za-z]\{2,\}[[:space:]]*[-–—][[:space:]]*//')
-    # "[Site.tld] " prefix
-    result=$(echo "$result" | sed 's/^\[[A-Za-z0-9._-]*\][[:space:]]*//')
+    # "[Site.tld] " or "[ Site.tld ] - " prefix (with optional dash/en-dash/em-dash separator)
+    result=$(echo "$result" | sed 's/^\[[A-Za-z0-9._ -]*\][[:space:]]*[-–—][[:space:]]*//')
+    # "[Site.tld] " prefix without dash separator
+    result=$(echo "$result" | sed 's/^\[[A-Za-z0-9._ -]*\][[:space:]]*//')
     echo "$result"
 }
 
@@ -1468,6 +1470,43 @@ else
         fi
     done < <(find "$FOLDER" -mindepth 2 -type f -name "* - 0[0-9].*" -print0)
 
+    # Delete junk subfolders (Extras, Sample, Screenshots) unless the parent movie/series
+    # is actually named that (e.g. a movie called "Extras" or "Sample")
+    junk_folders_deleted=0
+    junk_folder_names="Extras|Sample|Screenshots"
+    while IFS= read -r -d '' junk_dir; do
+        # Get the parent folder name (the movie/series folder)
+        parent_name=$(basename "$(dirname "$junk_dir")")
+        # Strip year suffix like "(2020)" to get the bare title for comparison
+        parent_title=$(echo "$parent_name" | sed 's/ ([0-9]\{4\})$//')
+        parent_title_lower=$(echo "$parent_title" | tr '[:upper:]' '[:lower:]')
+        dir_basename=$(basename "$junk_dir")
+        dir_basename_lower=$(echo "$dir_basename" | tr '[:upper:]' '[:lower:]')
+        # Skip deletion if the parent movie/series title matches the junk folder name
+        if [ "$parent_title_lower" = "$dir_basename_lower" ]; then
+            echo "  Keeping subfolder: $dir_basename (parent \"$parent_name\" matches)"
+            continue
+        fi
+        rm -rf "$junk_dir"
+        echo "  Deleted junk folder: $parent_name/$dir_basename"
+        ((junk_folders_deleted++))
+    done < <(find "$FOLDER" -mindepth 2 -type d \( -iname "Extras" -o -iname "Sample" -o -iname "Screenshots" -o -iname "Covers" \) -print0)
+
+    # Rename "SubFiles" and "Subtitles" subfolders to "Subs" for consistency
+    subs_renamed=0
+    while IFS= read -r -d '' sub_dir; do
+        parent_dir=$(dirname "$sub_dir")
+        target_dir="${parent_dir}/Subs"
+        old_name=$(basename "$sub_dir")
+        if [ -d "$target_dir" ]; then
+            echo "  Skipping rename: Subs already exists in $(basename "$parent_dir")"
+        else
+            mv "$sub_dir" "$target_dir"
+            echo "  Renamed subfolder: $(basename "$parent_dir")/$old_name → Subs"
+            ((subs_renamed++))
+        fi
+    done < <(find "$FOLDER" -mindepth 2 -type d \( -iname "SubFiles" -o -iname "Subtitles" \) -print0)
+
     # Remove empty directories left behind after cleanup
     empty_dirs_deleted=0
     while IFS= read -r -d '' empty_dir; do
@@ -1478,6 +1517,8 @@ else
     echo "Sample videos deleted: $samples_deleted"
     [ "$zero_deleted" -gt 0 ] && echo "Zero-byte files deleted: $zero_deleted"
     [ "$duplicates_deleted" -gt 0 ] && echo "Duplicate files deleted: $duplicates_deleted"
+    [ "$junk_folders_deleted" -gt 0 ] && echo "Junk folders deleted: $junk_folders_deleted"
+    [ "$subs_renamed" -gt 0 ] && echo "SubFiles folders renamed: $subs_renamed"
     [ "$empty_dirs_deleted" -gt 0 ] && echo "Empty folders removed: $empty_dirs_deleted"
 fi
 
@@ -1606,6 +1647,8 @@ echo "  Junk files deleted: $junk_deleted"
 echo "  Sample videos deleted: $samples_deleted"
 [ "${zero_deleted:-0}" -gt 0 ] && echo "  Zero-byte files deleted: $zero_deleted"
 [ "${duplicates_deleted:-0}" -gt 0 ] && echo "  Duplicate files deleted: $duplicates_deleted"
+[ "${junk_folders_deleted:-0}" -gt 0 ] && echo "  Junk folders deleted: $junk_folders_deleted"
+[ "${subs_renamed:-0}" -gt 0 ] && echo "  SubFiles folders renamed: $subs_renamed"
 if [ "$PERMUTE_CHOICE" != "none" ]; then
     echo "  Files sent to Permute ${PERMUTE_CHOICE}: $permute_count"
 fi
