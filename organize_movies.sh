@@ -201,23 +201,42 @@ SKIP_LOG="${FOLDER}Foldersskipped.txt"
 # ========================================
 # Reprocess Mode Detection
 # ========================================
-# If a skip log already exists, enter reprocess mode:
-# only retry the previously-skipped items instead of processing everything.
+# If a skip log already exists, ask the user whether to reprocess
+# skipped items or start fresh (ignoring the log).
 REPROCESS_MODE=false
 skipped_paths=()
 
 if [ -f "$SKIP_LOG" ]; then
-    REPROCESS_MODE=true
-    # Parse FULL PATH entries from existing skip log
-    while IFS= read -r line; do
-        if [[ $line =~ ^FULL\ PATH:\ (.+)$ ]]; then
-            skipped_paths+=("${BASH_REMATCH[1]}")
-        fi
-    done < "$SKIP_LOG"
-    echo ""
-    echo "Reprocess mode: found Foldersskipped.txt"
-    echo "  Retrying ${#skipped_paths[@]} previously-skipped items..."
-    echo ""
+    reprocess_action=$(osascript -e "
+    display dialog \"A previous skip log (Foldersskipped.txt) was found in this folder.
+
+Choose how to proceed:\" buttons {\"Cancel\", \"Start Fresh\", \"Reprocess Skipped\"} default button \"Reprocess Skipped\" with title \"Media Organizer v${VERSION}\"
+    set the button_pressed to the button returned of the result
+    return button_pressed
+    " 2>/dev/null)
+
+    if [ -z "$reprocess_action" ] || [ "$reprocess_action" = "Cancel" ]; then
+        echo "Cancelled. Exiting."
+        exit 1
+    fi
+
+    if [ "$reprocess_action" = "Reprocess Skipped" ]; then
+        REPROCESS_MODE=true
+        # Parse FULL PATH entries from existing skip log
+        while IFS= read -r line; do
+            if [[ $line =~ ^FULL\ PATH:\ (.+)$ ]]; then
+                skipped_paths+=("${BASH_REMATCH[1]}")
+            fi
+        done < "$SKIP_LOG"
+        echo ""
+        echo "Reprocess mode: found Foldersskipped.txt"
+        echo "  Retrying ${#skipped_paths[@]} previously-skipped items..."
+        echo ""
+    else
+        echo ""
+        echo "Starting fresh: ignoring existing Foldersskipped.txt"
+        echo ""
+    fi
 fi
 
 # Create/clear the skipped log file (fresh for this run)
@@ -295,6 +314,8 @@ strip_torrent_prefix() {
     result=$(echo "$result" | sed 's/^\[[A-Za-z0-9._ -]*\][[:space:]]*[-–—][[:space:]]*//')
     # "[Site.tld] " prefix without dash separator
     result=$(echo "$result" | sed 's/^\[[A-Za-z0-9._ -]*\][[:space:]]*//')
+    # Bare leading "- " or "– " or "— " prefix (stray separator with no site name)
+    result=$(echo "$result" | sed 's/^[-–—][[:space:]]*//')
     echo "$result"
 }
 
